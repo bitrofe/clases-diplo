@@ -10,7 +10,7 @@ import {
   getListEnergyEquipmentQueryKey,
   getListEnergyRecordsQueryKey,
 } from '@workspace/api-client-react';
-import type { EnergyRecordInput } from '@workspace/api-client-react';
+import { ApiError, type EnergyRecordInput } from '@workspace/api-client-react';
 import {
   Activity,
   CalendarDays,
@@ -35,7 +35,8 @@ import { Route, Switch, useLocation, Router as WouterRouter } from 'wouter';
 
 const queryClient = new QueryClient();
 
-type CsvPreview = { records: EnergyRecordInput[]; filename: string };
+type CsvPreview = { records: EnergyRecordInput[]; filename: string; totalKwh: number; totalCostEur: number };
+type ImportIssue = { index: number; message: string };
 
 function formatNumber(value: number | undefined, digits = 0) {
   return Number(value ?? 0).toLocaleString('es-ES', {
@@ -52,6 +53,38 @@ function formatDate(value: string) {
   const date = new Date(`${value.slice(0, 10)}T12:00:00`);
   if (Number.isNaN(date.getTime())) return value;
   return date.toLocaleDateString('es-ES', { day: '2-digit', month: 'short', year: 'numeric' });
+}
+
+// `new Date('2026-02-30')` no falla: pasa al 1 de marzo. Aquí se exige que el día exista.
+function isCalendarDate(value: string) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
+  const date = new Date(`${value}T00:00:00.000Z`);
+  return !Number.isNaN(date.getTime()) && date.toISOString().slice(0, 10) === value;
+}
+
+// Con «;» el CSV viene en formato europeo: «1.234,5» son 1234,5 kWh, no 1,234.
+function parseCsvNumber(value: string, delimiter: string) {
+  const text = value.trim();
+  if (delimiter !== ';') return Number(text);
+  if (/^\d{1,3}(\.\d{3})+(,\d+)?$/.test(text)) return Number(text.replace(/\./g, '').replace(',', '.'));
+  return Number(text.replace(',', '.'));
+}
+
+// Lecturas que triplican la mediana de su equipo (con al menos 3 lecturas): no se rechazan, se marcan.
+function findOutliers(records: { id: number; equipment: string; consumptionKwh: number }[]) {
+  const byEquipment = new Map<string, number[]>();
+  for (const record of records) byEquipment.set(record.equipment, [...(byEquipment.get(record.equipment) ?? []), record.consumptionKwh]);
+  const medians = new Map<string, number>();
+  for (const [name, values] of byEquipment) {
+    if (values.length < 3) continue;
+    const sorted = [...values].sort((a, b) => a - b);
+    const middle = Math.floor(sorted.length / 2);
+    medians.set(name, sorted.length % 2 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2);
+  }
+  return new Set(records.filter((record) => {
+    const median = medians.get(record.equipment);
+    return median !== undefined && median > 0 && record.consumptionKwh > median * 3;
+  }).map((record) => record.id));
 }
 
 function readCsvRows(text: string, delimiter: string) {
@@ -114,20 +147,26 @@ function parseEnergyCsv(text: string, filename: string): CsvPreview {
   const records = rows.slice(1).map((values, rowIndex) => {
     const equipment = values[equipmentIndex]?.trim() ?? '';
     const measuredAt = values[dateIndex]?.trim() ?? '';
-    const parseNumber = (value: string) =>
-      Number(delimiter === ';' ? value.replace(',', '.').trim() : value.trim());
+    const parseNumber = (value: string) => parseCsvNumber(value, delimiter);
     const consumptionKwh = parseNumber(values[kwhIndex] ?? '');
     const costText = costIndex < 0 ? '' : values[costIndex]?.trim() ?? '';
     const costEur = costText ? parseNumber(costText) : undefined;
-    const validDate = /^\d{4}-\d{2}-\d{2}$/.test(measuredAt) &&
-      !Number.isNaN(new Date(`${measuredAt}T12:00:00`).getTime());
+    const validDate = isCalendarDate(measuredAt);
+    if (!validDate && /^\d{4}-\d{2}-\d{2}$/.test(measuredAt)) {
+      throw new Error(`Revisa la fila ${rowIndex + 2}: la fecha ${measuredAt} no existe en el calendario.`);
+    }
     if (!equipment || equipment.length > 160 || !validDate || !Number.isFinite(consumptionKwh) ||
       consumptionKwh < 0 || (costEur !== undefined && (!Number.isFinite(costEur) || costEur < 0))) {
       throw new Error(`Revisa la fila ${rowIndex + 2}: indica equipo, fecha AAAA-MM-DD y valores numéricos no negativos.`);
     }
     return { equipment, measuredAt, consumptionKwh, ...(costEur === undefined ? {} : { costEur }) };
   });
-  return { records, filename };
+  return {
+    records,
+    filename,
+    totalKwh: records.reduce((total, record) => total + record.consumptionKwh, 0),
+    totalCostEur: records.reduce((total, record) => total + (record.costEur ?? 0), 0),
+  };
 }
 
 function SummaryChart({ monthly }: { monthly: { month: string; totalKwh: number; totalCostEur: number }[] }) {
@@ -173,10 +212,12 @@ function ImportDialog({ onClose, onImported }: { onClose: () => void; onImported
   const importMutation = useImportEnergyRecords();
   const [preview, setPreview] = useState<CsvPreview | null>(null);
   const [error, setError] = useState('');
+  const [issues, setIssues] = useState<ImportIssue[]>([]);
   const inputRef = useRef<HTMLInputElement>(null);
   const onFile = async (file?: File) => {
     if (!file) return;
     setError('');
+    setIssues([]);
     try {
       setPreview(parseEnergyCsv(await file.text(), file.name));
     } catch (caught) {
@@ -188,7 +229,11 @@ function ImportDialog({ onClose, onImported }: { onClose: () => void; onImported
     if (!preview) return;
     importMutation.mutate({ data: { records: preview.records } }, {
       onSuccess: onImported,
-      onError: (caught) => setError(caught instanceof Error ? caught.message : 'Import failed. Try again.'),
+      onError: (caught) => {
+        const data = caught instanceof ApiError ? caught.data as { error?: string; issues?: ImportIssue[] } | null : null;
+        setIssues(Array.isArray(data?.issues) ? data.issues : []);
+        setError(data?.error ?? (caught instanceof Error ? caught.message : 'Import failed. Try again.'));
+      },
     });
   };
   return (
@@ -209,8 +254,10 @@ function ImportDialog({ onClose, onImported }: { onClose: () => void; onImported
           <input ref={inputRef} className="file-input" type="file" accept=".csv,text/csv" aria-label="Choose CSV file" data-testid="input-csv-file" onChange={(event) => onFile(event.target.files?.[0])} />
           <p className="csv-help">Columnas necesarias: <span className="mono">equipo, fecha, consumo_kwh</span><br />Opcional: <span className="mono">coste_eur</span> · fecha <span className="mono">AAAA-MM-DD</span>. También se aceptan los nombres de columna en inglés.</p>
         </div>
-        {preview && <div className="preview"><span><Check size={14} style={{ verticalAlign: 'middle', marginRight: 6, color: '#26766c' }} />{preview.filename}</span><span className="mono">{preview.records.length} filas</span></div>}
-        {error && <div className="dialog-error" role="alert">{error}</div>}
+        {preview && <div className="preview"><span><Check size={14} style={{ verticalAlign: 'middle', marginRight: 6, color: '#26766c' }} />{preview.filename}</span><span className="mono">{preview.records.length} filas · {formatNumber(preview.totalKwh, 1)} kWh · {formatEuro(preview.totalCostEur)}</span></div>}
+        {error && <div className="dialog-error" role="alert">{error}
+          {issues.length > 0 && <ul className="issue-list">{issues.slice(0, 8).map((issue) => <li key={`${issue.index}-${issue.message}`}>Fila {issue.index + 2}: {issue.message}</li>)}{issues.length > 8 && <li>… y {issues.length - 8} más</li>}</ul>}
+        </div>}
         <div className="dialog-actions">
           <button className="button button-quiet" type="button" onClick={onClose}>Cancelar</button>
           <button className="button button-primary" type="button" disabled={!preview || importMutation.isPending} data-testid="button-submit-import" onClick={submit}>
@@ -244,6 +291,7 @@ function Overview() {
   const deleteMutation = useDeleteEnergyRecord();
   const records = recordsQuery.data ?? [];
   const summary = summaryQuery.data;
+  const outliers = useMemo(() => findOutliers(records), [records]);
   const equipmentOptions = useMemo(() => {
     const names = [...(equipmentQuery.data ?? []).map((item) => item.equipment), ...(summary?.equipment ?? []).map((item) => item.equipment)];
     return [...new Set(names)].sort((a, b) => a.localeCompare(b));
@@ -327,12 +375,12 @@ function Overview() {
             <article className="metric primary" data-testid="metric-total-consumption">
               <div className="metric-label">Consumo total <Activity size={14} /></div>
               <div className="metric-value">{formatNumber(summary?.totalKwh)}<span className="metric-unit">kWh</span></div>
-              <div className="metric-foot">{from && to ? summary?.previousTotalKwh ? <><span className="change">{summary.changePercent > 0 ? '+' : ''}{formatNumber(summary.changePercent, 1)}%</span> frente al periodo anterior <span>·</span> {formatNumber(summary.previousTotalKwh, 1)} kWh</> : 'Sin consumo en el periodo anterior' : from || to ? 'Periodo seleccionado · sin comparativa' : 'Todo el histórico · sin comparativa'}</div>
+              <div className="metric-foot">{from && to ? summary?.changePercent != null ? <><span className="change">{summary.changePercent > 0 ? '+' : ''}{formatNumber(summary.changePercent, 1)}%</span> frente al periodo anterior <span>·</span> {formatNumber(summary.previousTotalKwh, 1)} kWh</> : 'Sin consumo en el periodo anterior' : from || to ? 'Periodo seleccionado · sin comparativa' : 'Todo el histórico · sin comparativa'}</div>
             </article>
             <article className="metric" data-testid="metric-total-cost">
               <div className="metric-label">Coste total <Database size={13} /></div>
               <div className="metric-value">{formatEuro(summary?.totalCostEur)}</div>
-              <div className="metric-foot">En el periodo seleccionado</div>
+              <div className="metric-foot">{summary?.recordsWithoutCost ? <span className="metric-warn" data-testid="text-records-without-cost"><CircleAlert size={11} />{formatNumber(summary.recordsWithoutCost)} {summary.recordsWithoutCost === 1 ? 'medición sin coste' : 'mediciones sin coste'}: el total no las incluye</span> : 'En el periodo seleccionado'}</div>
             </article>
             <article className="metric" data-testid="metric-record-count">
               <div className="metric-label">Mediciones <FileSpreadsheet size={13} /></div>
@@ -382,7 +430,7 @@ function Overview() {
                     <tr key={record.id} data-testid={`row-energy-record-${record.id}`}>
                       <td><div className="equip-cell"><span className="equip-icon"><Activity size={13} /></span>{record.equipment}</div></td>
                       <td className="mono">{formatDate(record.measuredAt)}</td>
-                      <td className="mono">{formatNumber(record.consumptionKwh, 1)} kWh</td>
+                      <td className="mono">{formatNumber(record.consumptionKwh, 1)} kWh{outliers.has(record.id) && <span className="outlier-badge" title="Triplica la mediana de este equipo: revisa la lectura" data-testid={`badge-outlier-${record.id}`}>atípica</span>}</td>
                       <td className="mono">{record.costEur == null ? '—' : formatEuro(record.costEur)}</td>
                       <td style={{ textAlign: 'right' }}><button className="delete-button" type="button" title="Eliminar medición" aria-label={`Eliminar medición de ${record.equipment} del ${formatDate(record.measuredAt)}`} disabled={deleteMutation.isPending} onClick={() => removeRecord(record.id)} data-testid={`button-delete-record-${record.id}`}><Trash2 size={14} /></button></td>
                     </tr>

@@ -38,7 +38,10 @@ _Populate as you build — explicit user instructions worth remembering across s
 
 ## Gotchas
 
-_Populate as you build — sharp edges, "always run X before Y" rules._
+- Energy readings are validated on the server in `artifacts/api-server/src/lib/energy-validation.ts` (tests: `pnpm --filter @workspace/api-server run test`). An import is all-or-nothing: any issue returns 400 with `issues: [{ index, message }]` and nothing is saved.
+- Rules: the date must exist (`2026-02-30` is rejected; Zod alone would turn it into 1 March) and not be later than tomorrow (UTC); kWh ≤ `ENERGY_MAX_KWH_PER_READING` (default 50000); if there is a cost, cost ÷ kWh must fall between `ENERGY_MIN_TARIFF_EUR_KWH` and `ENERGY_MAX_TARIFF_EUR_KWH` (defaults 0.05–0.60 €/kWh); no repeated equipment + date, in the file or against the database. The defaults are placeholders: set them to the facility's real equipment and tariff.
+- `changePercent` is `null` (not 0) when there is no previous period to compare with; `recordsWithoutCost` tells the UI that `totalCostEur` leaves some readings out.
+- CSV files separated by `;` use the European number format: `1.234,5` is 1234.5 kWh.
 
 ## Pointers
 

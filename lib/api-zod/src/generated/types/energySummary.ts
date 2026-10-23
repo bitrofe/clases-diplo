@@ -12,9 +12,12 @@ export interface EnergySummary {
   totalKwh: number;
   totalCostEur: number;
   recordCount: number;
+  /** Readings without costEur; totalCostEur leaves them out. */
+  recordsWithoutCost: number;
   equipmentCount: number;
   previousTotalKwh: number;
-  changePercent: number;
+  /** Null when there is no from/to period or the previous period has no consumption. */
+  changePercent: number | null;
   monthly: EnergyMonthlySummary[];
   equipment: EquipmentSummary[];
 }

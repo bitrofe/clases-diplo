@@ -15,8 +15,16 @@ import {
   ListEnergyRecordsQueryParams,
   ListEnergyRecordsResponse,
 } from "@workspace/api-zod";
+import {
+  isCalendarDate,
+  limitsFromEnv,
+  percentChange,
+  readingKey,
+  validateReadings,
+} from "../lib/energy-validation";
 
 const router: IRouter = Router();
+const validationLimits = limitsFromEnv();
 
 function asDateString(value: Date): string {
   return value.toISOString().slice(0, 10);
@@ -118,14 +126,50 @@ router.post("/energy/records", async (req, res): Promise<void> => {
     res.status(400).json({ error: parsed.error.message });
     return;
   }
-  const recordsToInsert = parsed.data.records.map((record) => {
-    const converted = {
-      ...record,
-      measuredAt: asDateString(record.measuredAt),
+  // Zod convierte la fecha en Date y "2026-02-30" pasa a ser el 1 de marzo:
+  // la fecha se valida sobre el texto que llegó.
+  const rawRecords: unknown[] = Array.isArray(req.body?.records) ? req.body.records : [];
+  const readings = parsed.data.records.map((record, index) => {
+    const raw = (rawRecords[index] as { measuredAt?: unknown } | undefined)?.measuredAt;
+    return {
+      equipment: record.equipment.trim(),
+      measuredAt:
+        typeof raw === "string" && /^\d{4}-\d{2}-\d{2}$/.test(raw)
+          ? raw
+          : asDateString(record.measuredAt),
+      consumptionKwh: record.consumptionKwh,
       costEur: record.costEur ?? null,
     };
-    return insertEnergyRecordSchema.parse(converted);
   });
+  const dates = readings.map((reading) => reading.measuredAt).filter(isCalendarDate).sort();
+  const existing = dates.length
+    ? await db
+        .select({
+          equipment: energyRecordsTable.equipment,
+          measuredAt: energyRecordsTable.measuredAt,
+        })
+        .from(energyRecordsTable)
+        .where(
+          and(
+            gte(energyRecordsTable.measuredAt, dates[0]),
+            lte(energyRecordsTable.measuredAt, dates[dates.length - 1]),
+          ),
+        )
+    : [];
+  const issues = validateReadings(readings, {
+    today: asDateString(new Date()),
+    existingKeys: existing.map((record) => readingKey(record.equipment, record.measuredAt)),
+    limits: validationLimits,
+  });
+  if (issues.length) {
+    const badReadings = new Set(issues.map((issue) => issue.index)).size;
+    res.status(400).json({
+      error: `No se importó nada: ${badReadings} ${badReadings === 1 ? "medición tiene" : "mediciones tienen"} problemas.`,
+      issues,
+    });
+    return;
+  }
+  const recordsToInsert = readings.map((reading) => insertEnergyRecordSchema.parse(reading));
   const records = await db
     .insert(energyRecordsTable)
     .values(recordsToInsert)
@@ -248,17 +292,8 @@ router.get("/energy/summary", async (req, res): Promise<void> => {
       recordCount: currentRecords.length,
       equipmentCount: equipment.length,
       previousTotalKwh: Number(previousTotalKwh.toFixed(3)),
-      changePercent:
-        from && to
-          ? previousTotalKwh === 0
-            ? 0
-            : Number(
-                (
-                  ((totalKwh - previousTotalKwh) / previousTotalKwh) *
-                  100
-                ).toFixed(1),
-              )
-          : 0,
+      changePercent: from && to ? percentChange(totalKwh, previousTotalKwh) : null,
+      recordsWithoutCost: currentRecords.filter((record) => record.costEur == null).length,
       monthly,
       equipment,
     }),

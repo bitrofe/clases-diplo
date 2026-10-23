@@ -91,9 +91,10 @@ export const GetEnergySummaryResponse = zod.object({
   "totalKwh": zod.number(),
   "totalCostEur": zod.number(),
   "recordCount": zod.number().int(),
+  "recordsWithoutCost": zod.number().int(),
   "equipmentCount": zod.number().int(),
   "previousTotalKwh": zod.number(),
-  "changePercent": zod.number(),
+  "changePercent": zod.number().nullable(),
   "monthly": zod.array(zod.object({
   "month": zod.string(),
   "totalKwh": zod.number(),

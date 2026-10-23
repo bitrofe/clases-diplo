@@ -67,6 +67,11 @@ paths:
               schema:
                 type: array
                 items: { $ref: "#/components/schemas/EnergyRecord" }
+        "400":
+          description: >-
+            Nothing was imported. Body is `{ error, issues: [{ index, message }] }`, where
+            `index` is the position of the reading in `records` (impossible or future dates,
+            readings over the kWh cap, implied tariff out of range, duplicates).
   /energy/records/{id}:
     delete:
       operationId: deleteEnergyRecord
@@ -170,14 +175,19 @@ components:
         totalCostEur: { type: number }
     EnergySummary:
       type: object
-      required: [totalKwh, totalCostEur, recordCount, equipmentCount, previousTotalKwh, changePercent, monthly, equipment]
+      required: [totalKwh, totalCostEur, recordCount, recordsWithoutCost, equipmentCount, previousTotalKwh, changePercent, monthly, equipment]
       properties:
         totalKwh: { type: number }
         totalCostEur: { type: number }
         recordCount: { type: integer }
+        recordsWithoutCost:
+          type: integer
+          description: Readings without costEur; totalCostEur leaves them out.
         equipmentCount: { type: integer }
         previousTotalKwh: { type: number }
-        changePercent: { type: number }
+        changePercent:
+          type: ["number", "null"]
+          description: Null when there is no from/to period or the previous period has no consumption.
         monthly:
           type: array
           items: { $ref: "#/components/schemas/EnergyMonthlySummary" }
