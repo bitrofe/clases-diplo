@@ -1,0 +1,28 @@
+kind = "web"
+previewPath = "/"
+title = "Energy Usage"
+description = "Aplicación para importar registros de consumo energético, consultar y filtrar mediciones, y comparar resúmenes por equipo a lo largo del tiempo."
+version = "1.0.0"
+id = "artifacts/energy-usage"
+router = "path"
+
+[[services]]
+name = "web"
+paths = [ "/" ]
+localPort = 18461
+
+[services.development]
+run = "pnpm --filter @workspace/energy-usage run dev"
+
+[services.production]
+build = [ "pnpm", "--filter", "@workspace/energy-usage", "run", "build" ]
+serve = "static"
+publicDir = "artifacts/energy-usage/dist/public"
+
+[[services.production.rewrites]]
+from = "/*"
+to = "/index.html"
+
+[services.env]
+PORT = "18461"
+BASE_PATH = "/"
